@@ -15,46 +15,34 @@
 #include "strings.h"
 #include "system.h"
 
-struct Client {
-    Memory_context         *context;
+typedef struct Task Task;
 
-    s32                     socket;         // The client socket's file descriptor.
-    s64                     start_time;     // When we accepted the connection.
-
+struct Task {
     enum {
-        PARSING_REQUEST=1,
-        HANDLING_REQUEST,
-        SENDING_REPLY,
-        READY_TO_CLOSE,
-    }                       phase;
+        DEAL_WITH_A_CLIENT=1,
+        REFRESH_FILE_TREE,
+        TIME_TO_WIND_UP,
+    }                       type;
+    union {
+        // If the type is DEAL_WITH_A_CLIENT:
+        Client             *client;
 
-    char_array              message;        // A buffer for storing bytes received.
-    s16_array               crlf_offsets;
-    Request                 request;
-
-    Response                response;
-
-    char_array              reply_header;   // Our response's header in text form.
-    s64                     num_bytes_sent; // The total number of bytes we've sent of our response. Includes both header and body.
-
-    enum {
-        HTTP_VERSION_1_0=1,
-        HTTP_VERSION_1_1,
-    }                       http_version;
-    bool                    keep_alive;     // Whether to keep the socket open after processing the request.
+        // If the type is REFRESH_FILE_TREE:
+        File_tree_accessor *file_tree_accessor;
+    };
 };
 
-struct Client_queue {
+struct Task_queue {
     pthread_mutex_t         mutex;
     pthread_cond_t          ready;          // The server will broadcast when there are tasks.
 
-    Array(Client*);
-    Client                **head;           // A pointer to the first element in the array that hasn't been taken from the queue. If it points to the element after the end of the array, the queue is empty.
+    Array(Task);
+    Task                   *head;           // A pointer to the first element in the array that hasn't been taken from the queue. If it points to the element after the end of the array, the queue is empty.
 };
 
-static Client_queue *create_queue(Memory_context *context)
+static Task_queue *create_queue(Memory_context *context)
 {
-    Client_queue *queue = NewArray(queue, context);
+    Task_queue *queue = NewArray(queue, context);
 
     pthread_mutex_init(&queue->mutex, NULL);
     pthread_cond_init(&queue->ready, NULL);
@@ -65,9 +53,9 @@ static Client_queue *create_queue(Memory_context *context)
     return queue;
 }
 
-static void add_to_queue(Client_queue *queue, Client *client)
+static void add_to_queue(Task_queue *queue, Task task)
 {
-    Client_queue *q = queue;
+    Task_queue *q = queue;
 
     pthread_mutex_lock(&q->mutex);
 
@@ -78,35 +66,34 @@ static void add_to_queue(Client_queue *queue, Client *client)
 
     if (q->count == q->limit && head_index > 0) {
         // We're out of room in the array, but there's space to the left of the head. Shift the head back to the start of the array.
-        memmove(q->data, q->head, (q->count - head_index)*sizeof(Client*));
+        memmove(q->data, q->head, (q->count - head_index)*sizeof(q->data[0]));
         q->count  -= head_index;
         head_index = 0;
     }
 
-    *Add(q) = client;
+    *Add(q) = task;
     q->head = &q->data[head_index];
 
     if (queue_was_empty)  pthread_cond_broadcast(&q->ready);
     pthread_mutex_unlock(&q->mutex);
 }
 
-static Client *pop_queue(Client_queue *queue)
+static Task pop_queue(Task_queue *queue)
 {
-    Client_queue *q = queue;
+    Task_queue *q = queue;
 
     pthread_mutex_lock(&q->mutex);
     while (q->head == &q->data[q->count])  pthread_cond_wait(&q->ready, &q->mutex);
 
-    Client *client = *q->head;
+    Task task = *q->head;
     q->head += 1;
 
     pthread_mutex_unlock(&q->mutex);
-    return client;
+    return task;
 }
 
 static bool receive_message(Client *client)
 // Try to read from the client socket. Return true if we received data and there was no error or disconnection.
-// In other words return true if the caller should try to parse the received data.
 {
     char_array *message = &client->message;
     if (message->limit == 0) {
@@ -222,7 +209,7 @@ static bool parse_request(Client *client)
     //
     {
         char_array  *path  = &client->request.path;
-        string_dict *query = &client->request.query;
+        string_dict *query = &client->request.query_params;
 
         char_array key   = {.context = ctx};
         char_array value = {.context = ctx};
@@ -328,6 +315,7 @@ static bool parse_request(Client *client)
 
 static Request_handler *find_request_handler(Server *server, Client *client)
 // Find a route for a client and return the route handler.
+// Also save pointers to the route and the result of the matching regex on the client.
 {
     assert(client->phase == HANDLING_REQUEST);
 
@@ -340,7 +328,8 @@ static Request_handler *find_request_handler(Server *server, Client *client)
 
         Match *match = run_regex(route->path_regex, request->path.data, request->path.count, client->context);
         if (match->success) {
-            request->path_params = copy_capture_groups(match, client->context);
+            client->route       = route;
+            client->route_match = match;
 
             return route->handler;
         }
@@ -435,10 +424,11 @@ static bool send_reply(Client *client)
     return true;
 }
 
-static void init_client(Client *client, Memory_context *context, s32 socket, s64 start_time)
+static void init_client(Server *server, Client *client, Memory_context *context, s32 socket, s64 start_time)
 {
     *client                   = (Client){0};
 
+    client->server            = server;
     client->context           = context;
     client->start_time        = start_time;
     client->socket            = socket;
@@ -448,7 +438,7 @@ static void init_client(Client *client, Memory_context *context, s32 socket, s64
     client->crlf_offsets      = (s16_array){.context = context};
 
     client->request.path      = (char_array){.context = context};
-    client->request.query     = (string_dict){.context = context};
+    client->request.query_params = (string_dict){.context = context};
 
     client->response.headers  = (string_dict){.context = context};
 
@@ -506,16 +496,27 @@ static char_array *encode_query_string(string_dict *query, Memory_context *conte
     return result;
 }
 
+void refresh_file_tree(File_tree_accessor *accessor); //|Temporary: Until we put the File_tree_accessor stuff into its own module.
+
 static void *worker_thread_routine(void *arg)
 // The worker thread's main loop.
 {
     Server *server = arg;
-    Client_queue *queue = server->work_queue;
+    Task_queue *queue = server->task_queue;
 
     while (true)
     {
-        Client *client = pop_queue(queue);
-        if (!client)  break; // The server adds NULL pointers to the queue to tell the workers it's time to wind up.
+        Task task = pop_queue(queue);
+
+        if (task.type == TIME_TO_WIND_UP)  break;
+
+        if (task.type == REFRESH_FILE_TREE) {
+            refresh_file_tree(task.file_tree_accessor);
+            continue;
+        }
+
+        assert(task.type == DEAL_WITH_A_CLIENT); //|Cleanup: From here to the end of the loop should be its own function.
+        Client *client = task.client;
 
         if (client->phase == PARSING_REQUEST) {
             bool received = receive_message(client);
@@ -528,7 +529,7 @@ static void *worker_thread_routine(void *arg)
             if (!handler)  handler = &serve_404;
 
             // Run the handler.
-            client->response = (*handler)(&client->request, client->context);
+            client->response = (*handler)(client);
             assert(client->response.status);
 
             client->phase = SENDING_REPLY;
@@ -540,20 +541,23 @@ static void *worker_thread_routine(void *arg)
             bool success = send_reply(client);
 
             if (success) {
+                s64 current_time = get_monotonic_time();
+
                 { // |Cleanup: This logging bit in general.
                     Memory_context *ctx = client->context;
                     Request *req = &client->request;
                     char *method = req->method == GET ? "GET" : req->method == POST ? "POST" : "UNKNOWN!!";
                     char *path   = req->path.count ? req->path.data : "";
-                    char *query  = req->query.count ? encode_query_string(&req->query, ctx)->data : "";
-                    printf("[%d] %s %s%s\n", client->response.status, method, path, query);
+                    char *query  = req->query_params.count ? encode_query_string(&req->query_params, ctx)->data : "";
+                    s64 ms = current_time - client->start_time; //|Fixme: The fact that we use the client->start_time here results in inaccurate logging about how long requests take, because browsers leave connections open for a long time in between requests. Instead we should be using the time when we received the first byte of the request.
+                    printf("[%d] %s %s%s %ldms\n", client->response.status, method, path, query, ms);
                     fflush(stdout);
                 }
 
                 if (client->keep_alive) {
                     // Reset the client and prepare to receive more data on the socket.
                     reset_context(client->context);
-                    init_client(client, client->context, client->socket, get_monotonic_time());
+                    init_client(server, client, client->context, client->socket, current_time);
                 } else {
                     client->phase = READY_TO_CLOSE;
                 }
@@ -636,7 +640,7 @@ Server *create_server(u32 address, u16 port, Memory_context *context)
 
     server->clients = (Client_map){.context = context, .binary_mode = true};
 
-    server->work_queue = create_queue(context);
+    server->task_queue = create_queue(context);
 
     server->worker_threads = (pthread_t_array){.context = context};
     int NUM_WORKER_THREADS = 4; //|Todo: Make this configurable or find out how many processors the computer has.
@@ -665,12 +669,167 @@ void add_route(Server *server, enum HTTP_method method, char *path_pattern, Requ
     *Add(&server->routes) = (Route){method, regex, handler};
 }
 
+#ifndef FILE_TREE_STUFF_WHICH_WE_WILL_PROBABLY_PUT_INTO_ITS_OWN_MODULE
+//typedef struct File_tree_accessor File_tree_accessor;
+typedef struct File_tree_resource File_tree_resource;
+
+struct File_tree_accessor {
+    Memory_context     *context;
+
+    char               *directory;
+
+    pthread_mutex_t     mutex;
+    File_tree_resource *resource;
+};
+
+struct File_tree_resource {
+    // A child context of the accessor's context. It contains everything to do with
+    // this resource including the resource struct itself.
+    Memory_context     *context;
+
+    struct {
+        pthread_mutex_t     mutex;
+        int                 value;
+    }                   num_refs;
+
+    File_node          *file_tree;
+    s64                 time_created;
+
+    // The first thread to notice that a resource has expired sets update_pending = true
+    // to let other threads know that it is taking responsibility for the update.
+    struct {
+        pthread_mutex_t     mutex;
+        bool                value;
+    }                   update_pending;
+};
+
+File_tree_resource *acquire_file_tree(File_tree_accessor *accessor)
+{
+    File_tree_resource *resource = NULL;
+
+    pthread_mutex_lock(&accessor->mutex);
+    {
+        // Now that we've locked the accessor's mutex, we know that the resource the accessor points
+        // to is valid and cannot be deleted while we hold the mutex. This is true because:
+        // - A resource will not be deallocated until its .num_refs reaches 0.
+        // - Every resource has its .num_refs initialised to 1 before any accessor points to it.
+        // - Every thread that accesses a resource increments .num_refs before decrementing it.
+        // - The one exception to the above point is the routine responsible for updating an
+        //   accessor's resource, which also locks the accessor's mutex and changes the accessor's
+        //   pointer before decrementing the old resource's .num_refs.
+        resource = accessor->resource;
+
+        // Increment .num_refs so the resource stays valid after we unlock the accessor's mutex.
+        pthread_mutex_lock(&resource->num_refs.mutex);
+        {
+            resource->num_refs.value += 1;
+        }
+        pthread_mutex_unlock(&resource->num_refs.mutex);
+    }
+    pthread_mutex_unlock(&accessor->mutex);
+
+    return resource;
+}
+
+void free_file_tree_resource(File_tree_resource *resource)
+{
+    assert(resource->num_refs.value == 0);
+
+    pthread_mutex_destroy(&resource->num_refs.mutex);
+    pthread_mutex_destroy(&resource->update_pending.mutex);
+
+    free_context(resource->context);
+}
+
+bool release_file_tree(File_tree_resource *resource)
+// Return true if we were the last one to release the resource and hence must clean it up.
+{
+    int num_refs;
+    pthread_mutex_lock(&resource->num_refs.mutex);
+    {
+        resource->num_refs.value -= 1;
+        num_refs = resource->num_refs.value;
+    }
+    pthread_mutex_unlock(&resource->num_refs.mutex);
+
+    return (num_refs == 0);
+}
+
+void refresh_file_tree(File_tree_accessor *accessor)
+// Replace the current resource on the accessor. Clean up the old resource if no-one else has a reference to it.
+{
+    Memory_context *context = new_context(accessor->context);
+
+    File_tree_resource *resource = New(File_tree_resource, context);
+    resource->context = context;
+    pthread_mutex_init(&resource->update_pending.mutex, NULL);
+
+    resource->file_tree = get_file_tree(accessor->directory, context);
+
+    resource->time_created = get_monotonic_time();//|Todo: Maybe take this as an arg.
+    pthread_mutex_init(&resource->num_refs.mutex, NULL);
+    resource->num_refs.value = 1;
+
+    // Put the resource on the accessor.
+    File_tree_resource *old_resource;
+    pthread_mutex_lock(&accessor->mutex);
+    {
+        old_resource = accessor->resource;
+        accessor->resource = resource;
+    }
+    pthread_mutex_unlock(&accessor->mutex);
+
+    if (!old_resource)  return; // This lets us also use this function to create a resource for the first time, assuming the accessor has already been initialised except for its resource member, which should be NULL.
+
+    bool should_clean_up = release_file_tree(old_resource);
+
+    if (should_clean_up)  free_file_tree_resource(old_resource);
+}
+
+File_tree_accessor *create_file_tree_accessor(char *directory, Memory_context *context)
+{
+    Memory_context *sub_context = new_context(context); // |Memory
+
+    File_tree_accessor *accessor = New(File_tree_accessor, sub_context);
+    accessor->context = sub_context;
+    pthread_mutex_init(&accessor->mutex, NULL);
+
+    // Copy the directory path, sans the trailing slash if there is one.
+    {
+        int length = strlen(directory);
+        if (directory[length-1] == '/')  length -= 1;
+
+        accessor->directory = copy_string(directory, length, context).data;
+    }
+
+    refresh_file_tree(accessor);
+
+    return accessor;
+}
+#endif
+
+void add_file_route(Server *server, char *path_pattern, char *directory)
+// Add a route to serve files under a given directory.
+//
+// We might want to make this more flexible later: directory could be a single file (which, if it won't change, we could just keep in memory for the program's lifetime!---that will mean extending the concept of a "shared resource"). Also, the path_pattern could be like "files/(?<file_name>.*)"---that is, have a special capture group that gets taken as the file path rather than the full request path.
+{
+    Regex *regex = compile_regex(path_pattern, server->context);
+    assert(regex);
+
+    Route route = {GET, regex, &serve_files};
+
+    route.file_tree_accessor = create_file_tree_accessor(directory, server->context);
+
+    //|Robustness: Assert the server hasn't started.
+    *Add(&server->routes) = route;
+}
+
 void start_server(Server *server)
 {
     //
     // The pollfds array is both the array of file descriptors passed to poll() and the authoritative list
     // of the clients currently owned by the main thread. The main thread initialises a memory context for
-    // new clients and then passes them to worker threads via the server.work_queue. Until a worker thread
+    // new clients and then passes them to worker threads via the server.task_queue. Until a worker thread
     // sends the client pointer back to the server via the worker pipe, it owns (i.e. can modify) the
     // Client struct and the client's memory context. Separately the server maintains server.clients, a
     // hash table containing all open connections, keyed by the file descriptors of the open sockets. This
@@ -754,11 +913,11 @@ void start_server(Server *server)
                 set_blocking(client_socket, false);
 
                 Client *client = New(Client, server->context);
-                init_client(client, new_context(server->context), client_socket, current_time);
+                init_client(server, client, new_context(server->context), client_socket, current_time);
 
                 assert(!IsSet(&server->clients, client_socket));
                 *Set(&server->clients, client_socket) = client;
-                add_to_queue(server->work_queue, client);
+                add_to_queue(server->task_queue, (Task){DEAL_WITH_A_CLIENT, .client=client});
                 continue;
             }
 
@@ -781,7 +940,7 @@ void start_server(Server *server)
                 // We can read from or write to a client socket.
                 Client *client = *Get(&server->clients, pollfd->fd);
                 assert(client);
-                add_to_queue(server->work_queue, client);
+                add_to_queue(server->task_queue, (Task){DEAL_WITH_A_CLIENT, .client=client});
                 array_unordered_remove_by_index(&pollfds, pollfd_index);
                 continue; //|Cleanup: We continue in every case?
             }
@@ -806,7 +965,7 @@ void start_server(Server *server)
     }
 
     // Signal to the worker threads that it's time to wind up.
-    for (s64 i = 0; i < server->worker_threads.count; i++)  add_to_queue(server->work_queue, NULL);
+    for (s64 i = 0; i < server->worker_threads.count; i++)  add_to_queue(server->task_queue, (Task){TIME_TO_WIND_UP});
 
     // Join the worker threads.
     for (int i = 0; i < server->worker_threads.count; i++) {
@@ -823,82 +982,162 @@ void start_server(Server *server)
     }
 }
 
-Response serve_file_insecurely(Request *request, Memory_context *context)
-//|Insecure!! This function will serve any file in your filesystem, even supporting '..' in paths to go up a directory.
+Response create_index_page(File_node *file_node, Memory_context *context)
 {
-    char *path = request->path.data;
-    s64 path_size = request->path.count;
+    assert(file_node->type == DIRECTORY);
 
-    // If the path starts with a '/', "remove" it by advancing the pointer 1 byte.
-    if (*path == '/') {
-        path      += 1;
-        path_size -= 1;
+    char_array doc = get_string(context, "<!DOCTYPE HTML>\n");
+    append_string(&doc, "<html>\n");
+
+    append_string(&doc, "<head>\n");
+    append_string(&doc, "<title>%s</title>\n", file_node->name);
+    append_string(&doc, "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n");
+    append_string(&doc, "</head>\n");
+
+    append_string(&doc, "<body>\n");
+    append_string(&doc, "<p><a href=\"../\">[Go up a directory.]</a></p>\n");
+    append_string(&doc, "<h1>%s</h1>\n", file_node->name);
+
+    //
+    // Make two passes over the child nodes to print the directories first.
+    //
+    for (s64 i = 0; i < file_node->children.count; i++) {
+        File_node *child = &file_node->children.data[i];
+        if (child->type == DIRECTORY) {
+            append_string(&doc, "<p><a href=\"%s/\">%s/</a></p>\n", child->name, child->name);
+        }
     }
-
-    u8_array *file = load_binary_file(path, context);
-    if (!file) {
-        char static body[] = "We couldn't find that file.\n";
-        return (Response){404, .body=body, .size=lengthof(body)};
+    for (s64 i = 0; i < file_node->children.count; i++) {
+        File_node *child = &file_node->children.data[i];
+        if (child->type != DIRECTORY) {
+            append_string(&doc, "<p><a href=\"%s\">%s</a></p>\n", child->name, child->name);
+        }
     }
+    append_string(&doc, "</body>\n");
+    append_string(&doc, "</html>\n");
 
-    char *file_extension = NULL;
+    string_dict headers = (string_dict){.context = context};
+    *Set(&headers, "content-type") = "text/html";
 
-    for (s64 i = path_size-1; i >= 0; i--) {
-        if (path[i] == '/')  break;
-        if (path[i] == '.') {
-            if (i < path_size-1)  file_extension = &path[i+1];
-            break;
+    return (Response){200, .headers=headers, .body=doc.data, .size=doc.count};
+}
+
+Response serve_files(Client *client)
+{
+    File_tree_accessor *accessor = client->route->file_tree_accessor;
+    File_tree_resource *resource = acquire_file_tree(accessor);
+
+    // Check whether the resource has expired. If the file tree is older than CACHE_TIMEOUT milliseconds,
+    // we'll schedule it to be created again, though we'll still use the old one for the current request.
+    s64 CACHE_TIMEOUT = 1000;
+    s64 current_time = get_monotonic_time();
+    bool expired = (current_time - resource->time_created) > CACHE_TIMEOUT;
+
+    // Check whether a different thread is taking responsibility for updating the resource.
+    bool we_should_update = false;
+    if (expired) {
+        int r = pthread_mutex_trylock(&resource->update_pending.mutex);
+        if (r == 0) {
+            // We got the lock on .update_pending. If we're the first one here, it's up to us.
+            we_should_update = (resource->update_pending.value == false);
+            resource->update_pending.value = true;
+            pthread_mutex_unlock(&resource->update_pending.mutex);
+        } else if (r == EBUSY) {
+            // Do nothing. The only thing we ever do with .update_pending is set it once,
+            // so if someone else has the lock, we know it's set.
+        } else {
+            Fatal("Failed to trylock a mutex: %s", get_error_info(r).string);
         }
     }
 
-    char *content_type = NULL;
+    if (we_should_update) {
+        Task_queue *task_queue = client->server->task_queue;
+        add_to_queue(task_queue, (Task){REFRESH_FILE_TREE, .file_tree_accessor=accessor});
+    }
 
-    if (file_extension) {
+    Memory_context *context = client->context;
+    Request        *request = &client->request;
+
+    Response response = {0};
+
+    File_node *file_node = find_file_node(&request->path.data[1], resource->file_tree);
+
+    if (!file_node) {
+        char static body[] = "That file isn't on our list.\n";
+        response = (Response){404, .body=body, .size=lengthof(body)};
+        goto done;
+    }
+
+    if (file_node->type == DIRECTORY) {
+        File_node *index = find_file_node("index.html", file_node);
+        if (index) {
+            file_node = index;
+        } else if (request->path.data[request->path.count-1] == '/') {
+            // There is no index.html in this directory. Create an index page dynamically.
+            response = create_index_page(file_node, context);
+            goto done;
+        } else {
+            //
+            // The request path doesn't end with a slash. Force the client to send it again with a slash.
+            // This is mean, but it makes it easier for us to create index pages dynamically, because if
+            // a web page's URL ends with a slash, browsers treat links on the page as relative to the
+            // page itself. So this means we can link to the files in this directory just by their name.
+            //
+            char static body[] = "This page has moved permanently.\n";
+            response = (Response){301, .body=body, .size=lengthof(body)};
+            response.headers = (string_dict){.context = context};
+            *Set(&response.headers, "location") = get_string(context, "%s/", request->path.data).data;
+            goto done;
+        }
+    }
+
+    if (file_node->type != REGULAR_FILE) {
+        char static body[] = "We can't serve that type of file.\n";
+        response = (Response){403, .body=body, .size=lengthof(body)};
+        goto done;
+    }
+
+    u8_array *file = load_binary_file(file_node->path.data, context);
+    if (!file) {
+        char static body[] = "That file is on our list, yet it doesn't exist.\n";
+        response = (Response){500, .body=body, .size=lengthof(body)};
+        goto done;
+    }
+
+    response = (Response){200, .body=file->data, .size=file->count};
+
+    char *content_type = NULL;
+    for (s64 i = file_node->path.count-1; i >= 0; i--) {
+        if (file_node->path.data[i] == '/')  break;
+        if (file_node->path.data[i] != '.')  continue;
+
+        char *file_extension = &file_node->path.data[i+1];
+
         if (!strcmp(file_extension, "html"))       content_type = "text/html";
         else if (!strcmp(file_extension, "js"))    content_type = "text/javascript";
         else if (!strcmp(file_extension, "json"))  content_type = "application/json";
         else if (!strcmp(file_extension, "ttf"))   content_type = "font/ttf";
+
+        break;
+    }
+    if (content_type) {
+        response.headers = (string_dict){.context = context};
+        *Set(&response.headers, "content-type") = content_type;
     }
 
-    string_dict headers = {.context = context};
-    if (content_type)  *Set(&headers, "content-type") = content_type;
+done:;
+    bool should_clean_up = release_file_tree(resource);
 
-    return (Response){200, headers, file->data, file->count};
+    if (should_clean_up) {
+        // Clean up the old resource. We could create a task to schedule this work on a different thread
+        // rather than making the current request wait, but there's no need because cleaning up is fast.
+        free_file_tree_resource(resource);
+    }
+
+    return response;
 }
 
-#ifndef nocheckin
-//
-// when we go to serve a file:
-//     we want to check whether the path is in our list of allowed files.
-//     so we try to get a read lock on the shared resource.
-//     when we get the read lock:
-//     check whether the list exists.
-//     check whether the cached list has expired according to our metric.
-//     if it doesn't exist or it has expired:
-//         it needs to be fetched.
-//         release the read lock.
-//         acqure a write lock. when we get that:
-//         again check whether it exists or has expired, since it might have been updated.
-//         if it still doesn't exist:
-//             do the work to get the resource.
-//             save it.
-//         release the write lock
-//         acquire a read lock.
-//     get the info we need from the list.
-//     release the read lock.
-//
-//
-//struct Shared_resource {
-//    pthread_rwlock_t    rwlock;
-//    void               *data;
-//};
-//
-//Response serve_files(Request *request, Memory_context *context)
-//{
-//}
-#endif //nocheckin
-
-Response serve_404(Request *request, Memory_context *context)
+Response serve_404(Client *client)
 {
     char const static body[] = "Can't find it.\n";
 

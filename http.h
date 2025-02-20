@@ -13,7 +13,8 @@ typedef struct Route       Route;
 typedef Array(Route)       Route_array;
 typedef Map(s32, Client*)  Client_map;
 typedef Array(pthread_t)   pthread_t_array;
-typedef struct Client_queue Client_queue;
+typedef struct Task_queue  Task_queue;
+typedef struct File_tree_accessor File_tree_accessor;
 
 struct Server {
     Memory_context         *context;
@@ -28,7 +29,7 @@ struct Server {
 
     Client_map              clients;
 
-    Client_queue           *work_queue;
+    Task_queue             *task_queue;
     pthread_t_array         worker_threads;
     s32                     worker_pipe[2];     // File descriptors for the pipe that workers use to communicate to the server (read, write).
 };
@@ -38,32 +39,68 @@ enum HTTP_method {GET=1, POST}; // We can add HTTP_ prefixes to these later if w
 struct Request {
     enum HTTP_method        method;
     char_array              path;
-    string_array            path_params;
-    string_dict             query;//|Todo: Rename query_params.
+    string_dict             query_params;
+};
+
+// A Request_handler is a function that takes a pointer to a Client and returns a Response.
+typedef Response Request_handler(Client*);
+
+struct Route {
+    enum HTTP_method        method;
+    Regex                  *path_regex;
+    Request_handler        *handler;
+    File_tree_accessor     *file_tree_accessor;
 };
 
 struct Response {
     int                     status;
     string_dict             headers;        // The request handler is expected to set the content-type header. The server sets the content-length header.
     void                   *body;
-    s64                     size;           // The number of bytes in the body. If 0, body (if set) points to a zero-terminated string.
+    s64                     size;           // The number of bytes in the body.
 };
 
-// A Request_handler is a function that takes a pointer to a Request and returns a Response.
-typedef Response Request_handler(Request*, Memory_context*);
+struct Client {
+    Server                 *server;
+    Memory_context         *context;
 
-struct Route {
-    enum HTTP_method        method;
-    Regex                  *path_regex;
-    Request_handler        *handler;
+    s32                     socket;         // The client socket's file descriptor.
+    s64                     start_time;     // When we accepted the connection, or last reset the struct to be reused if client.keep_alive.
+
+    enum {
+        PARSING_REQUEST=1,
+        HANDLING_REQUEST,
+        SENDING_REPLY,
+        READY_TO_CLOSE,
+    }                       phase;
+
+    char_array              message;        // A buffer for storing bytes received.
+    s16_array               crlf_offsets;
+
+
+    Request                 request;
+
+    Route                  *route;
+    Match                  *route_match;    // The result of applying the matching route's path_regex to the request path.
+
+    Response                response;
+
+    char_array              reply_header;   // Our response's header in text form.
+    s64                     num_bytes_sent; // The total number of bytes we've sent of our response. Includes both header and body.
+
+    enum {
+        HTTP_VERSION_1_0=1,
+        HTTP_VERSION_1_1,
+    }                       http_version;
+    bool                    keep_alive;     // Whether to keep the socket open after processing the request.
 };
 
 Server *create_server(u32 address, u16 port, Memory_context *context);
 void start_server(Server *server);
 void add_route(Server *server, enum HTTP_method method, char *path_pattern, Request_handler *handler);
+void add_file_route(Server *server, char *path_pattern, char *directory);
 
 // Request_handler functions:
-Response serve_file_insecurely(Request *request, Memory_context *context);
-Response serve_404(Request *request, Memory_context *context);
+Response serve_files(Client *client); //|Cleanup: Remove this, because external code shouldn't use it directly, only via add_file_route().
+Response serve_404(Client *client);
 
 #endif // HTTP_H_INCLUDED
